@@ -130,6 +130,6 @@ The debug APK will be generated in the same `app/build/outputs/apk/debug/` direc
 
 ## About
 
-Penguin Purse is built by **Acry and her teammates**.
+Penguin Purse is built by **Acry tech and her teammates**.
 
 - GitHub: [@Cryjai](https://github.com/Cryjai)
