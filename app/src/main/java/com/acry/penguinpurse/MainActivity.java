@@ -4,6 +4,7 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.app.DatePickerDialog;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
@@ -33,6 +34,8 @@ import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.YearMonth;
@@ -254,6 +257,9 @@ public class MainActivity extends Activity {
         EditText amount = input("Amount", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
         if (edit) amount.setText(String.valueOf(existing.amount));
         form.addView(amount);
+        Spinner entryCurrency = spinner(new String[]{"HKD", "USD"});
+        form.addView(label("Currency (USD 會按今日匯率自動換成 HKD 入帳)"));
+        form.addView(entryCurrency);
 
         LinearLayout calc = row();
         EditText a = input("A", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL | InputType.TYPE_NUMBER_FLAG_SIGNED);
@@ -307,27 +313,29 @@ public class MainActivity extends Activity {
                 toast("Amount first,財神唔會讀心術。");
                 return;
             }
-            FinanceRecord r = edit ? existing : new FinanceRecord();
-            String oldMonth = edit ? monthOf(existing.date) : null;
-            r.amount = parse(amount.getText().toString());
-            r.type = type[0];
-            r.date = dateView.getText().toString();
-            r.category = category.getSelectedItem() == null ? "Other" : category.getSelectedItem().toString();
-            r.note = note.getText().toString();
-            r.currency = settings.baseCurrency;
-            long now = System.currentTimeMillis();
-            if (!edit) {
-                r.createdAt = now;
-                r.updatedAt = now;
-                dao.insertRecord(r);
-            } else {
-                r.updatedAt = now;
-                dao.updateRecord(r);
-                recalculateClosedMonth(oldMonth);
+            final double entered = parse(amount.getText().toString());
+            final boolean isUsd = "USD".equals(entryCurrency.getSelectedItem().toString());
+            if (!isUsd) {
+                saveRecordFromForm(existing, edit, type[0], entered, null, dateView, category, note);
+                return;
             }
-            recalculateClosedMonth(monthOf(r.date));
-            processMonthRollover();
-            showHome();
+            save.setEnabled(false);
+            save.setText("Fetching USD→HKD rate…");
+            new Thread(() -> {
+                final double rate = getUsdHkdRate();
+                runOnUiThread(() -> {
+                    if (isFinishing() || isDestroyed()) return;
+                    save.setEnabled(true);
+                    save.setText(edit ? "Save Changes" : "Save Record");
+                    if (rate <= 0) {
+                        toast("攞唔到今日 USD→HKD 匯率(又無舊 cache)。連網再試，或者揀 HKD 自己換。未儲存。");
+                        return;
+                    }
+                    saveRecordFromForm(existing, edit, type[0], entered * rate,
+                            String.format(Locale.US, "[USD %s @ %.4f]", money(entered), rate),
+                            dateView, category, note);
+                });
+            }).start();
         });
         form.addView(save);
         LinearLayout helper = row();
@@ -335,6 +343,66 @@ public class MainActivity extends Activity {
         helper.addView(text("Tap Save before your memory deletes the receipt like a scammer.", 13, Color.GRAY, false), weight());
         form.addView(helper);
         content.addView(form);
+    }
+
+    private void saveRecordFromForm(FinanceRecord existing, boolean edit, String typeValue, double amountHkd,
+                                    String fxTag, TextView dateView, Spinner category, EditText note) {
+        FinanceRecord r = edit ? existing : new FinanceRecord();
+        String oldMonth = edit ? monthOf(existing.date) : null;
+        r.amount = fxTag == null ? amountHkd : Math.round(amountHkd * 100.0) / 100.0;
+        r.type = typeValue;
+        r.date = dateView.getText().toString();
+        r.category = category.getSelectedItem() == null ? "Other" : category.getSelectedItem().toString();
+        String n = note.getText().toString();
+        r.note = fxTag == null ? n : (n.trim().isEmpty() ? fxTag : n + " " + fxTag);
+        r.currency = settings.baseCurrency;
+        long now = System.currentTimeMillis();
+        if (!edit) {
+            r.createdAt = now;
+            r.updatedAt = now;
+            dao.insertRecord(r);
+        } else {
+            r.updatedAt = now;
+            dao.updateRecord(r);
+            recalculateClosedMonth(oldMonth);
+        }
+        recalculateClosedMonth(monthOf(r.date));
+        processMonthRollover();
+        showHome();
+    }
+
+    /** USD→HKD 即日匯率。背景 thread 呼叫。失敗時用今日 cache，再唔得用最近一次 cache；全無則回傳 -1。 */
+    private double getUsdHkdRate() {
+        SharedPreferences sp = getSharedPreferences("fx_cache", MODE_PRIVATE);
+        String today = LocalDate.now().toString();
+        if (today.equals(sp.getString("date", "")) && sp.getFloat("usd_hkd", 0f) > 0f) {
+            return sp.getFloat("usd_hkd", 0f);
+        }
+        HttpURLConnection c = null;
+        try {
+            c = (HttpURLConnection) new URL("https://open.er-api.com/v6/latest/USD").openConnection();
+            c.setConnectTimeout(8000);
+            c.setReadTimeout(8000);
+            c.setRequestMethod("GET");
+            if (c.getResponseCode() == 200) {
+                StringBuilder sb = new StringBuilder();
+                try (BufferedReader br = new BufferedReader(new InputStreamReader(c.getInputStream(), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = br.readLine()) != null) sb.append(line);
+                }
+                JSONObject o = new JSONObject(sb.toString());
+                double rate = o.getJSONObject("rates").getDouble("HKD");
+                if ("success".equals(o.optString("result")) && rate > 6 && rate < 10) {
+                    sp.edit().putString("date", today).putFloat("usd_hkd", (float) rate).apply();
+                    return rate;
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            if (c != null) c.disconnect();
+        }
+        float last = sp.getFloat("usd_hkd", 0f);
+        return last > 0f ? last : -1;
     }
 
     private void showStats() {
